@@ -1333,6 +1333,7 @@ class BookEngine:
                 )
         except Exception as exc:
             self._mark_page_error(page, exc, prefix="Compilation failed")
+            await self._maybe_finalize_book(book_id)
             raise
 
         # Refresh KB fingerprints once we successfully ship a READY page.
@@ -1570,25 +1571,30 @@ class BookEngine:
         pages = self.storage.list_pages(book_id)
         if not pages:
             return
-        if not any(p.status in _UNFINISHED_PAGE_STATUSES for p in pages):
+        became_ready = (
+            not any(p.status in _UNFINISHED_PAGE_STATUSES for p in pages)
+            and book.status != BookStatus.READY
+        )
+        if became_ready:
             # Every page has settled — READY, or PARTIAL with blocks that will
             # not come back. The book is as done as it is going to get.
-            if book.status != BookStatus.READY:
-                book.status = BookStatus.READY
-                book.metadata = {
-                    k: v
-                    for k, v in (book.metadata or {}).items()
-                    if k not in {"pause_reason", "pause_kind"}
-                }
-                self.storage.save_book(book)
-                self.storage.append_log(book_id, "all pages ready → status=READY", op="finalize")
-                # Without this the reader never learns the book finished:
-                # the last page event fires while the book is still COMPILING.
-                await BookStream(get_book_bus(book_id)).book_event(
-                    "book_ready",
-                    {"book_id": book_id, "page_count": len(pages)},
-                    stage=STAGE_COMPILATION,
-                )
+            book.status = BookStatus.READY
+            book.metadata = {
+                k: v
+                for k, v in (book.metadata or {}).items()
+                if k not in {"pause_reason", "pause_kind"}
+            }
+        # A chapter can recover while the rest of an on-demand book is pending.
+        # Invalidate book-level diagnostics even when its status stays the same.
+        book.updated_at = time.time()
+        self.storage.save_book(book)
+        if became_ready:
+            self.storage.append_log(book_id, "all pages ready → status=READY", op="finalize")
+        await BookStream(get_book_bus(book_id)).book_event(
+            "book_ready" if became_ready else "generation_updated",
+            {"book_id": book_id, "page_count": len(pages)},
+            stage=STAGE_COMPILATION,
+        )
 
     # ── Block-level controls (Phase 1: regenerate single block) ─────────
 
@@ -1723,6 +1729,7 @@ class BookEngine:
         source_quality = (book.metadata or {}).get("source_quality")
         compiling = book.status == BookStatus.COMPILING
         working = compiling and self.is_worker_live(book.id)
+        on_demand = bool((book.metadata or {}).get("lazy_compile"))
         return {
             "status": book.status.value,
             "can_resume": book.status
@@ -1731,7 +1738,7 @@ class BookEngine:
             "source_quality": source_quality if isinstance(source_quality, dict) else None,
             # Live now, versus "says compiling but nobody is compiling it".
             "working": working,
-            "interrupted": compiling and not working,
+            "interrupted": compiling and not working and not on_demand,
             # Epoch seconds this compile run began, so every viewer's clock
             # agrees and survives a reload. 0 when no run has started.
             "started_at": float((book.metadata or {}).get("compile_started_at") or 0.0),
@@ -1766,6 +1773,12 @@ class BookEngine:
                 categories[category] = categories.get(category, 0) + 1
 
         overview = self.generation_overview(book)
+        on_demand = bool((book.metadata or {}).get("lazy_compile"))
+        active_pages = (
+            page_counts[PageStatus.PLANNING.value] + page_counts[PageStatus.GENERATING.value]
+        )
+        if book.status == BookStatus.COMPILING and not overview["working"] and active_pages:
+            overview["interrupted"] = True
         # Chapters still owed work. Queued is not the same as broken: while a
         # worker is running these are simply the tail of its queue, and
         # counting them as "retryable" is what made a healthy book announce
@@ -1778,7 +1791,7 @@ class BookEngine:
         failed = page_counts[PageStatus.ERROR.value]
         # Owed chapters become the reader's problem only when nothing is going
         # to pick them up: paused, errored, or a compile the process lost.
-        stalled = 0 if overview["working"] else queued
+        stalled = 0 if overview["working"] else active_pages if on_demand else queued
         retryable = failed + stalled
         return {
             "book_id": book.id,

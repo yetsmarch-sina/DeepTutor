@@ -2,6 +2,11 @@
 
 from __future__ import annotations
 
+from copy import deepcopy
+from typing import Any
+
+import pytest
+
 from deeptutor.services.llm.provider_core.openai_responses import (
     adapt_chat_kwargs_to_responses,
     convert_messages,
@@ -54,6 +59,68 @@ class TestAdaptChatKwargsToResponses:
         source = {"max_completion_tokens": 8192, "temperature": 0.2}
         adapt_chat_kwargs_to_responses(source)
         assert source == {"max_completion_tokens": 8192, "temperature": 0.2}
+
+    @pytest.mark.parametrize("format_type", ["json_object", "text"])
+    def test_translates_response_format_alongside_explicit_token_limit(
+        self, format_type: str
+    ) -> None:
+        result = adapt_chat_kwargs_to_responses(
+            {"response_format": {"type": format_type}, "max_output_tokens": 512}
+        )
+
+        assert result == {
+            "text": {"format": {"type": format_type}},
+            "max_output_tokens": 512,
+        }
+
+    def test_flattens_json_schema_and_preserves_other_text_settings(self) -> None:
+        schema = {
+            "name": "learning_plan",
+            "description": "A learning plan",
+            "strict": True,
+            "schema": {
+                "type": "object",
+                "properties": {"title": {"type": "string"}},
+                "required": ["title"],
+                "additionalProperties": False,
+            },
+        }
+        source = {
+            "response_format": {"type": "json_schema", "json_schema": schema},
+            "text": {"verbosity": "low"},
+            "max_completion_tokens": 512,
+        }
+        original = deepcopy(source)
+
+        result = adapt_chat_kwargs_to_responses(source)
+
+        assert result == {
+            "text": {"verbosity": "low", "format": {**schema, "type": "json_schema"}},
+            "max_output_tokens": 512,
+        }
+        assert source == original
+
+    def test_explicit_responses_format_takes_precedence(self) -> None:
+        result = adapt_chat_kwargs_to_responses(
+            {
+                "response_format": {"type": "json_object"},
+                "text": {"format": {"type": "text"}, "verbosity": "low"},
+            }
+        )
+
+        assert result == {"text": {"format": {"type": "text"}, "verbosity": "low"}}
+
+    @pytest.mark.parametrize(
+        "kwargs",
+        [
+            {"response_format": "json"},
+            {"response_format": {"type": "json_schema"}},
+            {"response_format": {"type": "json_object"}, "text": "invalid"},
+        ],
+    )
+    def test_rejects_malformed_format_settings(self, kwargs: dict[str, Any]) -> None:
+        with pytest.raises(ValueError):
+            adapt_chat_kwargs_to_responses(kwargs)
 
 
 class TestConvertMessages:

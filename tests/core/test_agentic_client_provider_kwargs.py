@@ -98,6 +98,112 @@ def test_agentic_kwargs_preserve_legacy_shape_without_binding() -> None:
     assert kwargs == {"temperature": 0.2, "max_tokens": 256}
 
 
+@pytest.mark.parametrize("model", ["gpt-6.1-terra", "o4-mini"])
+@pytest.mark.parametrize("binding", ["azure_openai", "azure"])
+def test_agentic_kwargs_omit_azure_model_temperature(model: str, binding: str) -> None:
+    kwargs = build_completion_kwargs(temperature=0.3, model=model, max_tokens=256, binding=binding)
+
+    assert "temperature" not in kwargs
+    assert kwargs["max_completion_tokens"] == 256
+
+
+@pytest.mark.parametrize(
+    ("binding", "model"),
+    [("azure_openai", "gpt-4.1"), ("openai", "o4-mini"), ("custom", "gpt-6.1-terra")],
+)
+def test_agentic_kwargs_preserve_other_model_temperatures(binding: str, model: str) -> None:
+    kwargs = build_completion_kwargs(temperature=0.3, model=model, max_tokens=256, binding=binding)
+
+    assert kwargs["temperature"] == 0.3
+
+
+@pytest.mark.asyncio
+async def test_azure_terra_uses_responses_adapter_with_reasoning_and_tools(monkeypatch) -> None:
+    captured: dict = {}
+
+    class FakeAzureProvider:
+        def __init__(self, **kwargs):
+            captured["constructor"] = kwargs
+
+        async def chat_stream(self, **kwargs):
+            captured["request"] = kwargs
+            return LLMResponse(
+                content=None,
+                finish_reason="tool_calls",
+                tool_calls=[
+                    ToolCallRequest(id="call-1", name="ask_user", arguments={"question": "Why?"})
+                ],
+            )
+
+    monkeypatch.setattr(
+        "deeptutor.services.llm.provider_core.azure_openai_provider.AzureOpenAIProvider",
+        FakeAzureProvider,
+    )
+    client = agentic_client._build_openai_client(
+        LLMClientConfig(
+            binding="azure_openai",
+            model="gpt-6.1-terra",
+            api_key="test-key",
+            base_url="https://res.openai.azure.com",
+            api_version="2025-04-01-preview",
+            extra_headers={"X-Test": "1"},
+            reasoning_effort="high",
+        ),
+        disable_ssl_verify=False,
+    )
+    assert isinstance(client, _ProviderOpenAIAdapter)
+    assert captured["constructor"] == {
+        "api_key": "test-key",
+        "api_base": "https://res.openai.azure.com",
+        "default_model": "gpt-6.1-terra",
+        "extra_headers": {"X-Test": "1"},
+        "api_version": "2025-04-01-preview",
+    }
+    tools = [
+        {"type": "function", "function": {"name": "ask_user", "parameters": {"type": "object"}}}
+    ]
+    choice = {"type": "function", "function": {"name": "ask_user"}}
+    stream = await client.chat.completions.create(
+        model="gpt-6.1-terra",
+        messages=[{"role": "user", "content": "Help me learn"}],
+        tools=tools,
+        tool_choice=choice,
+        stream=True,
+        **build_completion_kwargs(
+            binding="azure_openai",
+            model="gpt-6.1-terra",
+            max_tokens=256,
+            temperature=0.3,
+            reasoning_effort="high",
+        ),
+    )
+    chunks = [chunk async for chunk in stream]
+
+    assert captured["request"]["reasoning_effort"] == "high"
+    assert captured["request"]["tools"] == tools
+    assert captured["request"]["tool_choice"] == choice
+    calls = [call for chunk in chunks for call in (chunk.choices[0].delta.tool_calls or [])]
+    assert calls[0].function.name == "ask_user"
+
+
+@pytest.mark.parametrize("model", ["o4-mini", "gpt-4.1"])
+def test_other_azure_models_keep_the_sdk_route(monkeypatch, model: str) -> None:
+    sentinel = object()
+    monkeypatch.setattr(agentic_client, "AsyncAzureOpenAI", lambda **kwargs: sentinel)
+    client = agentic_client._build_openai_client(
+        LLMClientConfig(
+            binding="azure_openai",
+            model=model,
+            api_key="test-key",
+            base_url="https://res.openai.azure.com",
+            api_version="2024-10-21",
+        ),
+        disable_ssl_verify=False,
+    )
+
+    assert client is sentinel
+
+
 @pytest.mark.asyncio
 async def test_provider_stream_exposes_final_reasoning_content() -> None:
     class FakeProvider:

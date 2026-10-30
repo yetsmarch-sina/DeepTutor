@@ -22,7 +22,7 @@ from typing import Any
 from deeptutor.services.config import load_system_settings
 from deeptutor.services.keypool import KeyPool, primary_api_key
 from deeptutor.services.llm import get_token_limit_kwargs, supports_tools
-from deeptutor.services.llm.capabilities import catalog_capability_override
+from deeptutor.services.llm.capabilities import catalog_capability_override, omit_azure_temperature
 from deeptutor.services.llm.exceptions import (
     LLMProviderError,
     LLMProviderTransportError,
@@ -156,6 +156,18 @@ def _build_openai_client(
         return _KeyRotatingClient(KeyPool(keys), clients)
     spec = find_by_name(config.binding)
     backend = effective_backend(spec, config.api_format)
+    if backend == "azure_openai" and (config.model or "").lower().startswith("gpt-6.1-terra"):
+        from deeptutor.services.llm.provider_core.azure_openai_provider import AzureOpenAIProvider
+
+        return _ProviderOpenAIAdapter(
+            AzureOpenAIProvider(
+                api_key=config.api_key,
+                api_base=config.base_url or "",
+                default_model=config.model,
+                extra_headers=config.extra_headers,
+                api_version=config.api_version,
+            )
+        )
     wire_api = wire_api_for_provider(config.wire_api, spec)
     if wire_api == "responses":
         from deeptutor.services.llm.provider_core import OpenAICompatProvider
@@ -757,6 +769,8 @@ def build_completion_kwargs(
             kwargs.pop(key, None)
         else:
             kwargs[key] = value
+    if omit_azure_temperature(spec.name if spec else binding, model):
+        kwargs.pop("temperature", None)
     return kwargs
 
 

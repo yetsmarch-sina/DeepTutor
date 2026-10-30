@@ -692,6 +692,13 @@ def requires_api_version(binding: str, model: str | None = None) -> bool:
     return bool(value)
 
 
+def omit_azure_temperature(binding: str | None, model: str | None) -> bool:
+    """Keep Azure models that reject custom sampling on their server default."""
+    return binding == "azure_openai" and (model or "").lower().startswith(
+        ("gpt-6.1-terra", "o4-mini")
+    )
+
+
 def get_effective_temperature(
     binding: str,
     model: str | None = None,
@@ -747,6 +754,7 @@ __all__ = [
     "supports_tools",
     "supports_vision",
     "requires_api_version",
+    "omit_azure_temperature",
     "get_effective_temperature",
     "disable_response_format_at_runtime",
     "is_response_format_disabled_at_runtime",

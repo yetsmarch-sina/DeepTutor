@@ -175,6 +175,20 @@ test("a compile the backend lost reads as stopped, not as still working", () => 
   assert.equal(activity.label, "Generation stopped unexpectedly");
 });
 
+test("an idle on-demand book does not report an interruption or live generation", () => {
+  const activity = buildBookActivity({
+    book: book({ metadata: { lazy_compile: true } }),
+    pages: [page({ status: "ready" }), page({ id: "pg_b", status: "pending" })],
+    generation: generation({ working: false, interrupted: false, queued_pages: 1 }),
+    progress: emptyBookProgress(),
+    t,
+  });
+
+  assert.equal(activity.live, false);
+  assert.notEqual(activity.phase, "interrupted");
+  assert.equal(activity.runStartedAt, null);
+});
+
 test("the run clock comes from the engine, so a reload does not restart it", () => {
   const startedAt = Date.now() / 1000 - 134;
   const activity = buildBookActivity({

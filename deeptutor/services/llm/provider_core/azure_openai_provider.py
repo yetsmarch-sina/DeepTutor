@@ -11,6 +11,7 @@ import uuid
 
 from openai import AsyncOpenAI
 
+from deeptutor.services.llm.capabilities import omit_azure_temperature
 from deeptutor.services.llm.openai_http_client import openai_client_kwargs
 from deeptutor.services.llm.provider_core.base import LLMProvider, LLMResponse
 from deeptutor.services.llm.provider_core.openai_responses import (
@@ -117,6 +118,8 @@ class AzureOpenAIProvider(LLMProvider):
         reasoning_effort: str | None = None,
     ) -> bool:
         if reasoning_effort and reasoning_effort.lower() != "none":
+            return False
+        if omit_azure_temperature("azure_openai", deployment_name):
             return False
         name = deployment_name.lower()
         return not any(token in name for token in ("gpt-5", "o1", "o3", "o4"))

@@ -70,6 +70,8 @@ export interface BookChatPanelProps {
   onClose: () => void;
   initialSessionId?: string | null;
   onSessionResolved?: (sessionId: string) => void;
+  prefillPrompt?: { id: string; text: string } | null;
+  onPrefillConsumed?: (id: string) => void;
 }
 
 function attachmentTypeFor(file: File): PendingAttachment["type"] | null {
@@ -107,6 +109,8 @@ export default function BookChatPanel({
   onClose,
   initialSessionId = null,
   onSessionResolved,
+  prefillPrompt,
+  onPrefillConsumed,
 }: BookChatPanelProps) {
   const { t } = useTranslation();
   const { language: appLanguage } = useAppShell();
@@ -122,6 +126,8 @@ export default function BookChatPanel({
   const retryTimersRef = useRef<Set<ReturnType<typeof setTimeout>>>(new Set());
   const scrollerRef = useRef<HTMLDivElement | null>(null);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
+  const inputRef = useRef<HTMLTextAreaElement | null>(null);
+  const appliedPromptRef = useRef<string | null>(null);
   const dragRef = useRef<{ startX: number; startWidth: number } | null>(null);
   const { isComposingRef, onCompositionStart, onCompositionEnd } =
     useImeComposing();
@@ -139,6 +145,17 @@ export default function BookChatPanel({
   useEffect(() => {
     browserStorage.writeRaw("local", "deeptutor.bookChat.width", String(width));
   }, [width]);
+
+  useEffect(() => {
+    if (!open || !prefillPrompt || appliedPromptRef.current === prefillPrompt.id) return;
+    appliedPromptRef.current = prefillPrompt.id;
+    // eslint-disable-next-line react-hooks/set-state-in-effect
+    setInput((current) =>
+      current.trim() ? `${current}\n\n${prefillPrompt.text}` : prefillPrompt.text,
+    );
+    inputRef.current?.focus();
+    onPrefillConsumed?.(prefillPrompt.id);
+  }, [open, prefillPrompt, onPrefillConsumed]);
 
   useEffect(() => {
     const retryTimers = retryTimersRef.current;
@@ -603,6 +620,7 @@ export default function BookChatPanel({
             </button>
           </Tooltip>
           <textarea
+            ref={inputRef}
             value={input}
             onChange={(e) => setInput(e.target.value)}
             placeholder={t("Ask about this page…")}

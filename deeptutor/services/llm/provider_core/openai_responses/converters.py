@@ -180,9 +180,9 @@ def adapt_chat_kwargs_to_responses(extra_kwargs: Mapping[str, Any]) -> dict[str,
     Callers building requests for the Chat Completions endpoint may pass
     ``max_completion_tokens`` for newer OpenAI models (o1/o3/gpt-4o/gpt-5.x)
     or ``max_tokens`` for older chat models. The Responses API does not accept
-    either name and uses ``max_output_tokens`` instead, so the OpenAI SDK raises
-    ``TypeError`` from ``responses.create`` before any HTTP request leaves the
-    client. See DeepTutor#437.
+    either name and uses ``max_output_tokens`` instead. Structured output uses
+    ``text.format`` instead of ``response_format``, with JSON Schema options
+    flattened into the format object.
 
     Drops keys with ``None`` values to match the existing merge filter, and
     only applies the alias when the caller did not already set the Responses
@@ -193,12 +193,26 @@ def adapt_chat_kwargs_to_responses(extra_kwargs: Mapping[str, Any]) -> dict[str,
         for key, value in extra_kwargs.items()
         if value is not None and key not in _CHAT_TOKEN_LIMIT_ALIASES
     }
-    if "max_output_tokens" in result:
-        return result
+    if "max_output_tokens" not in result:
+        for key in _CHAT_TOKEN_LIMIT_ALIASES:
+            value = extra_kwargs.get(key)
+            if value is not None:
+                result["max_output_tokens"] = value
+                break
 
-    for key in _CHAT_TOKEN_LIMIT_ALIASES:
-        value = extra_kwargs.get(key)
-        if value is not None:
-            result["max_output_tokens"] = value
-            break
+    response_format = result.pop("response_format", None)
+    if response_format is not None:
+        if not isinstance(response_format, Mapping):
+            raise ValueError("response_format must be a mapping.")
+        if response_format.get("type") == "json_schema":
+            schema = response_format.get("json_schema")
+            if not isinstance(schema, Mapping):
+                raise ValueError("response_format.json_schema must be a mapping.")
+            output_format = {**schema, "type": "json_schema"}
+        else:
+            output_format = dict(response_format)
+        text = result.get("text", {})
+        if not isinstance(text, Mapping):
+            raise ValueError("Responses text settings must be a mapping.")
+        result["text"] = {"format": output_format, **text}
     return result

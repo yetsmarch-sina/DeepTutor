@@ -1,5 +1,6 @@
 import { act, render, screen, waitFor } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import type { BookWsEvent } from "@/lib/book-api";
 
 const fixture = vi.hoisted(() => ({
   params: {} as { bookId?: string; pageId?: string },
@@ -11,6 +12,8 @@ const fixture = vi.hoisted(() => ({
   push: vi.fn(),
   replace: vi.fn(),
   notify: vi.fn(),
+  health: vi.fn(),
+  onBookEvent: null as ((event: BookWsEvent) => void) | null,
   t: (key: string, values?: Record<string, string>) =>
     key.replace(/{{(\w+)}}/g, (_match, name: string) => values?.[name] ?? ""),
 }));
@@ -51,14 +54,19 @@ vi.mock("@/lib/book-api", () => ({
     getPage: fixture.getPage,
     listLearningCaptures: fixture.listLearningCaptures,
     markVisited: fixture.markVisited,
+    health: fixture.health,
   },
 }));
 
-vi.mock("@/lib/use-book-stream", () => ({
-  useBookStream: vi.fn(),
-  bookEventKind: () => "",
-  bookEventPageId: () => null,
-}));
+vi.mock("@/lib/use-book-stream", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("@/lib/use-book-stream")>();
+  return {
+    ...actual,
+    useBookStream: (_id: string | null, onEvent: (event: BookWsEvent) => void) => {
+      fixture.onBookEvent = onEvent;
+    },
+  };
+});
 
 vi.mock("@/app/(workspace)/learning/books/components/BookLibrary", () => ({
   default: () => <div data-testid="book-library" />,
@@ -78,11 +86,20 @@ vi.mock("@/app/(workspace)/learning/books/components/BookGenerationActivity", ()
 vi.mock("@/app/(workspace)/learning/books/components/BookPausedBanner", () => ({
   default: () => null,
 }));
-vi.mock("@/app/(workspace)/learning/books/components/BookHealthBanner", () => ({
-  default: () => null,
-}));
 vi.mock("@/app/(workspace)/learning/books/components/BookChatPanel", () => ({
-  default: () => null,
+  default: ({
+    book,
+    page,
+    prefillPrompt,
+  }: {
+    book: { id: string };
+    page: { id: string };
+    prefillPrompt?: { text: string } | null;
+  }) => (
+    <div data-testid="page-chat" data-book-id={book.id} data-page-id={page.id}>
+      <textarea aria-label="Page question" readOnly value={prefillPrompt?.text || ""} />
+    </div>
+  ),
 }));
 vi.mock("@/app/(workspace)/learning/books/components/LearningCapturePanel", () => ({
   default: () => null,
@@ -109,6 +126,7 @@ function readyDetail() {
       status: "ready",
       can_edit: true,
       revision: 1,
+      updated_at: 1,
       metadata: {},
     },
     pages: [
@@ -143,9 +161,79 @@ beforeEach(() => {
   });
   fixture.replace.mockReset();
   fixture.notify.mockReset();
+  fixture.onBookEvent = null;
+  fixture.health.mockReset().mockResolvedValue({
+    kb_drift: { has_drift: false },
+    log_health: { block_failures: 0 },
+    generation: { failed_blocks: 0, failed_pages: 0, failure_categories: {} },
+  });
 });
 
 describe("book deep-link loading", () => {
+  it("refreshes a stale failure banner when generation diagnostics change", async () => {
+    fixture.params = { bookId: "book-1" };
+    const detail = readyDetail();
+    fixture.get.mockResolvedValue(detail);
+    fixture.health.mockResolvedValueOnce({
+      kb_drift: { has_drift: false },
+      log_health: { block_failures: 0 },
+      generation: { failed_blocks: 1, failed_pages: 0, failure_categories: {} },
+    });
+    render(<BookPage />);
+    expect(await screen.findByText("1 blocks failed to generate.")).toBeInTheDocument();
+
+    fixture.get.mockResolvedValue({
+      ...detail,
+      book: { ...detail.book, updated_at: 2 },
+    });
+    act(() => {
+      fixture.onBookEvent?.({
+        type: "progress",
+        metadata: { kind: "generation_updated", book_id: "book-1" },
+      });
+    });
+
+    await waitFor(() => {
+      expect(fixture.health).toHaveBeenCalledTimes(2);
+      expect(screen.queryByText("1 blocks failed to generate.")).not.toBeInTheDocument();
+    });
+  });
+
+  it("opens the current chapter chat with a visualization follow-up", async () => {
+    fixture.params = { bookId: "book-1", pageId: "page-1" };
+    fixture.get.mockResolvedValue(readyDetail());
+    render(<BookPage />);
+    await screen.findByTestId("page-reader");
+    expect(screen.queryByTestId("page-chat")).not.toBeInTheDocument();
+
+    act(() => {
+      window.dispatchEvent(
+        new CustomEvent("dt:visualize-prompt", { detail: "Explain parallel attention" }),
+      );
+    });
+
+    expect(screen.getByTestId("page-chat")).toHaveAttribute("data-book-id", "book-1");
+    expect(screen.getByTestId("page-chat")).toHaveAttribute("data-page-id", "page-1");
+    expect(screen.getByRole("textbox", { name: "Page question" })).toHaveValue(
+      "Explain parallel attention",
+    );
+  });
+
+  it("ignores empty or malformed visualization follow-ups", async () => {
+    fixture.params = { bookId: "book-1" };
+    fixture.get.mockResolvedValue(readyDetail());
+    render(<BookPage />);
+    await screen.findByTestId("page-reader");
+
+    act(() => {
+      for (const detail of [" ", { text: "not a prompt" }]) {
+        window.dispatchEvent(new CustomEvent("dt:visualize-prompt", { detail }));
+      }
+    });
+
+    expect(screen.queryByTestId("page-chat")).not.toBeInTheDocument();
+  });
+
   it("keeps a direct book URL in a book loading shell until details arrive", async () => {
     fixture.params = { bookId: "book-1" };
     let resolveDetails!: (value: ReturnType<typeof readyDetail>) => void;

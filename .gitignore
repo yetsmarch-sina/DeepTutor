@@ -71,6 +71,18 @@ MANIFEST
 *.env.local
 !.env.example
 
+# Private keys and local authentication files
+*.pem
+*.key
+*.p12
+*.pfx
+.netrc
+_netrc
+.pypirc
+/.ssh/
+/.aws/
+/.azure/
+
 # Virtual environments
 env/
 venv/

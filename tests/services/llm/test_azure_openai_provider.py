@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import json
 from typing import Any
 
+import httpx
 import pytest
 
 from deeptutor.services.llm.provider_core import azure_openai_provider as azure_mod
@@ -93,6 +95,36 @@ def test_extra_headers_override_defaults(monkeypatch: pytest.MonkeyPatch) -> Non
 
 
 @pytest.mark.parametrize(
+    ("model", "has_temperature"),
+    [("gpt-6.1-terra", False), ("o4-mini", False), ("gpt-4.1", True)],
+)
+@pytest.mark.parametrize("reasoning_effort", [None, "none"])
+def test_request_body_respects_model_temperature_support(
+    monkeypatch: pytest.MonkeyPatch,
+    model: str,
+    has_temperature: bool,
+    reasoning_effort: str | None,
+) -> None:
+    _capture(monkeypatch)
+    provider = azure_mod.AzureOpenAIProvider(
+        api_key="sk-test", api_base="https://res.openai.azure.com", default_model=model
+    )
+    body = provider._build_body(
+        messages=[{"role": "user", "content": "Hello"}],
+        tools=None,
+        model=None,
+        max_tokens=256,
+        temperature=0.3,
+        reasoning_effort=reasoning_effort,
+        tool_choice=None,
+    )
+
+    assert ("temperature" in body) is has_temperature
+    if has_temperature:
+        assert body["temperature"] == 0.3
+
+
+@pytest.mark.parametrize(
     ("api_version", "expected"),
     [
         ("preview", {"api-version": "preview"}),
@@ -130,3 +162,68 @@ def test_only_preview_api_version_reaches_the_v1_surface(
 def test_missing_credentials_are_rejected(api_key: str, api_base: str, match: str) -> None:
     with pytest.raises(ValueError, match=match):
         azure_mod.AzureOpenAIProvider(api_key=api_key, api_base=api_base)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("streaming", [False, True])
+async def test_json_output_reaches_responses_sdk_in_native_format(
+    monkeypatch: pytest.MonkeyPatch, streaming: bool
+) -> None:
+    captured: list[dict[str, Any]] = []
+    output = '{"title":"Transformer"}'
+    response = {
+        "id": "resp_test",
+        "object": "response",
+        "created_at": 0,
+        "status": "completed",
+        "model": "gpt-6.1-terra",
+        "output": [
+            {
+                "id": "msg_test",
+                "type": "message",
+                "status": "completed",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": output, "annotations": []}],
+            }
+        ],
+    }
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        captured.append(body)
+        if body["stream"]:
+            events = [
+                {"type": "response.output_text.delta", "delta": output},
+                {"type": "response.completed", "response": response},
+            ]
+            return httpx.Response(
+                200,
+                headers={"Content-Type": "text/event-stream"},
+                text="".join(f"data: {json.dumps(event)}\n\n" for event in events),
+            )
+        return httpx.Response(200, json=response)
+
+    monkeypatch.setattr(
+        azure_mod,
+        "openai_client_kwargs",
+        lambda: {"http_client": httpx.AsyncClient(transport=httpx.MockTransport(handle))},
+    )
+    provider = azure_mod.AzureOpenAIProvider(
+        api_key="test-key",
+        api_base="https://res.openai.azure.com",
+        default_model="gpt-6.1-terra",
+    )
+    try:
+        call = provider.chat_stream if streaming else provider.chat
+        result = await call(
+            messages=[{"role": "user", "content": "Return a JSON object with a title."}],
+            response_format={"type": "json_object"},
+        )
+    finally:
+        await provider._client.close()
+
+    assert result.finish_reason == "stop"
+    assert json.loads(result.content) == {"title": "Transformer"}
+    assert len(captured) == 1
+    assert "response_format" not in captured[0]
+    assert captured[0]["text"] == {"format": {"type": "json_object"}}

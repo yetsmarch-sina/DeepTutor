@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import pytest
+
+from deeptutor.book import engine as engine_module
 from deeptutor.book.engine import BookEngine
 from deeptutor.book.models import (
     Block,
@@ -10,6 +13,7 @@ from deeptutor.book.models import (
     Page,
     PageStatus,
 )
+from deeptutor.runtime.stream_bus import StreamBus
 
 
 def test_force_compile_reset_preserves_user_notes() -> None:
@@ -107,12 +111,19 @@ class _GenerationStorage:
     def __init__(self, book: Book, pages: list[Page]) -> None:
         self.book = book
         self.pages = pages
+        self.saved_books: list[Book] = []
 
     def load_book(self, book_id: str) -> Book | None:
         return self.book
 
     def list_pages(self, book_id: str) -> list[Page]:
         return self.pages
+
+    def save_book(self, book: Book) -> None:
+        self.saved_books.append(book.model_copy(deep=True))
+
+    def append_log(self, book_id: str, message: str, *, op: str) -> None:
+        pass
 
 
 class _LiveRuntime:
@@ -209,3 +220,73 @@ def test_generation_summary_surfaces_an_abandoned_compile() -> None:
     assert summary["interrupted"] is True
     assert summary["retryable_pages"] == 1
     assert summary["can_resume"] is True
+
+
+def test_on_demand_book_waiting_for_a_chapter_is_not_interrupted() -> None:
+    book = Book(id="bk", status=BookStatus.COMPILING, metadata={"lazy_compile": True})
+    engine = BookEngine.__new__(BookEngine)
+    engine.storage = _GenerationStorage(
+        book,
+        [Page(status=PageStatus.READY), Page(status=PageStatus.PENDING)],
+    )
+    engine._runtimes = {}
+
+    summary = engine.generation_summary("bk")
+
+    assert summary["working"] is False
+    assert summary["interrupted"] is False
+    assert summary["queued_pages"] == 1
+    assert summary["retryable_pages"] == 0
+    assert summary["can_resume"] is False
+
+
+@pytest.mark.parametrize("status", [PageStatus.PLANNING, PageStatus.GENERATING])
+def test_on_demand_book_still_reports_an_abandoned_active_chapter(status: PageStatus) -> None:
+    book = Book(id="bk", status=BookStatus.COMPILING, metadata={"lazy_compile": True})
+    engine = BookEngine.__new__(BookEngine)
+    engine.storage = _GenerationStorage(
+        book,
+        [Page(status=status), Page(status=PageStatus.PENDING)],
+    )
+    engine._runtimes = {}
+
+    summary = engine.generation_summary("bk")
+
+    assert summary["interrupted"] is True
+    assert summary["retryable_pages"] == 1
+    assert summary["can_resume"] is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("other_page_status", [PageStatus.PENDING, PageStatus.READY])
+async def test_chapter_recovery_updates_book_diagnostics_and_publishes_after_save(
+    monkeypatch: pytest.MonkeyPatch, other_page_status: PageStatus
+) -> None:
+    book = Book(
+        id="bk",
+        status=BookStatus.COMPILING,
+        updated_at=1,
+        metadata={"lazy_compile": True},
+    )
+    block = Block(type=BlockType.CALLOUT, status=BlockStatus.ERROR, error="empty response")
+    page = Page(status=PageStatus.PARTIAL, blocks=[block])
+    storage = _GenerationStorage(book, [page, Page(status=other_page_status)])
+    engine = BookEngine.__new__(BookEngine)
+    engine.storage = storage
+    bus = StreamBus()
+    monkeypatch.setattr(engine_module, "get_book_bus", lambda _: bus)
+    monkeypatch.setattr(engine_module.time, "time", lambda: 100.0)
+    assert engine.generation_summary("bk")["failed_blocks"] == 1
+
+    block.status = BlockStatus.READY
+    block.error = ""
+    page.status = PageStatus.READY
+    await engine._maybe_finalize_book("bk")
+
+    assert storage.saved_books[-1].updated_at == 100.0
+    assert engine.generation_summary("bk")["failed_blocks"] == 0
+    completed = other_page_status == PageStatus.READY
+    assert book.status == (BookStatus.READY if completed else BookStatus.COMPILING)
+    assert bus._history[-1].metadata["kind"] == (
+        "book_ready" if completed else "generation_updated"
+    )

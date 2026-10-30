@@ -78,6 +78,7 @@ const BOOK_SCOPED_EVENTS = new Set([
   'spine_ready',
   'overview_ready',
   'book_ready',
+  'generation_updated',
   'compilation_paused',
 ])
 
@@ -135,6 +136,15 @@ function BookPageInner() {
   // Phase 3 state
   const [pendingDeepDiveTopic, setPendingDeepDiveTopic] = useState<string | null>(null)
   const [chatOpen, setChatOpen] = useState(Boolean(requestedChatId))
+  const [chatPrompt, setChatPrompt] = useState<{
+    id: string
+    text: string
+    bookId: string
+    pageId: string
+  } | null>(null)
+  const consumeChatPrompt = useCallback((id: string) => {
+    setChatPrompt(current => (current?.id === id ? null : current))
+  }, [])
   const [shownChatId, setShownChatId] = useState(requestedChatId)
   if (shownChatId !== requestedChatId) {
     setShownChatId(requestedChatId)
@@ -367,6 +377,19 @@ function BookPageInner() {
     if (!detail || !selectedPageId) return null
     return detail.pages.find(p => p.id === selectedPageId) || null
   }, [detail, selectedPageId])
+
+  useEffect(() => {
+    if (view !== 'reader' || !selectedBookId || !selectedPage?.id) return
+    const pageId = selectedPage.id
+    const onPrompt = (event: Event) => {
+      const text = (event as CustomEvent<unknown>).detail
+      if (typeof text !== 'string' || !text.trim()) return
+      setChatPrompt({ id: randomUuid(), text: text.trim(), bookId: selectedBookId, pageId })
+      setChatOpen(true)
+    }
+    window.addEventListener('dt:visualize-prompt', onPrompt)
+    return () => window.removeEventListener('dt:visualize-prompt', onPrompt)
+  }, [view, selectedBookId, selectedPage?.id])
 
   // Reading order is the page order — the sidebar shows the same sequence.
   const pageNeighbours = useMemo(() => {
@@ -1248,6 +1271,12 @@ function BookPageInner() {
             page={selectedPage}
             open={chatOpen}
             onClose={() => setChatOpen(false)}
+            prefillPrompt={
+              chatPrompt?.bookId === detail?.book.id && chatPrompt?.pageId === selectedPage?.id
+                ? chatPrompt
+                : null
+            }
+            onPrefillConsumed={consumeChatPrompt}
             initialSessionId={selectedPageChatSessionId}
             onSessionResolved={sessionId => void handlePageChatSession(sessionId)}
           />
